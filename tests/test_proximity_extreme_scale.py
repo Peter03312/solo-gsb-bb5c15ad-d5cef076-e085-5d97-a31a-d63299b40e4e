@@ -4,7 +4,12 @@
 曾导致相遇漏报、接触追踪误判不可达。相遇区间计算对相对位置、相对速度与阈值
 按同一比例缩放后再解同一抛物线：有限输入的距离判定、区间端点与最小距离正确；
 仅距离严格小于阈值的正时长计入，恰等阈值或瞬时接触不计，接点不满足条件不合并。
+
+跨越正负范围的线性轨迹（端点 -1e308 与 1e308）插值时差值溢出为 Infinity/NaN、
+GEOS 求交在极大坐标下溢出返回空，曾导致相遇区间漏报、最小距离错误或响应不可
+序列化；修复后插值与求交均为溢出安全的等价形式，判定语义不变。
 """
+import json
 import math
 
 import pytest
@@ -250,3 +255,133 @@ def test_normal_scale_behavior_unchanged(client):
     assert seg["end"] == "2026-09-30T10:01:40Z"
     assert seg["duration_sec"] == 37.5
     assert seg["min_distance"] == 10.0
+
+
+# 跨越正负范围的极大有限坐标（端点 -1e308 与 1e308）：
+# 插值差值 2e308 溢出 float64、GEOS 求交溢出曾导致相遇漏报与响应不可序列化
+HUGE_SPAN_ZONE = [[-1.5e308, -1.5e308], [1.5e308, -1.5e308], [1.5e308, 1.5e308], [-1.5e308, 1.5e308]]
+T_END = "2026-09-30T10:01:40Z"  # T0 + 100s
+
+
+def _assert_strictly_serializable(body):
+    """响应必须可严格序列化（无 Infinity/NaN），且最小距离均为有限值。"""
+    json.dumps(body, allow_nan=False)
+    for pair in body["pairs"]:
+        for seg in pair["intervals"]:
+            assert math.isfinite(seg["min_distance"])
+
+
+def test_opposite_sign_span_crossing_encounter(client):
+    """漏报原案：A 自 (-1e308,0) 驶向 (1e308,0)，B 反向对开，t=50s 时相遇距离 0。
+    阈值 1e308：相遇区间为 (25s, 75s)，最小距离 0；接触追踪 B 于 25s 可达。"""
+    _register(client, "span1", HUGE_SPAN_ZONE)
+    _upload(client, "A", [("a", T0, -1e308, 0.0), ("b", T_END, 1e308, 0.0)])
+    _upload(client, "B", [("a", T0, 1e308, 0.0), ("b", T_END, -1e308, 0.0)])
+
+    r = _proximity(client, "span1", ["A", "B"], 1e308, until=T_END)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    _assert_strictly_serializable(body)
+    assert len(body["pairs"]) == 1
+    segs = body["pairs"][0]["intervals"]
+    assert [(s["start"], s["end"], s["duration_sec"], s["min_distance"]) for s in segs] == [
+        ("2026-09-30T10:00:25Z", "2026-09-30T10:01:15Z", 50.0, 0.0)
+    ]
+
+    # 接触传播沿用修复后的相遇区间：B 于相遇段起点 25s 可达（1 跳）
+    r = _tracing(client, "span1", "A", ["A", "B"], 1e308, until=T_END)
+    assert r.status_code == 200, r.text
+    results = {x["trip_id"]: x for x in r.json()["results"]}
+    assert results["A"]["reachable"] is True and results["A"]["hops"] == 0
+    assert results["B"]["reachable"] is True
+    assert results["B"]["arrived_at"] == "2026-09-30T10:00:25Z"
+    assert results["B"]["hops"] == 1
+    assert results["B"]["chain"] == ["A", "B"]
+
+
+def test_opposite_sign_span_moving_vs_stationary(client):
+    """±1e308 运动车对静止车：抛物线根（区间端点）与区间最小距离在极大
+    有限坐标下保持正确——与 1e155 尺度同构，端点与最小距离按同比例放大。"""
+    _register(client, "span2", HUGE_SPAN_ZONE)
+    # A(t) = (-1e308 + 2e306·t, 0)，t∈[0,100]；B 静止 (0, 5e307)；阈值 1e308
+    # |r(t)| < 1e308 ⟺ |2e306·t - 1e308| < sqrt(1e616 - 2.5e615) → t ∈ (6.6987298…, 93.3012701…)
+    _upload(client, "A", [("a", T0, -1e308, 0.0), ("b", T_END, 1e308, 0.0)])
+    _upload(client, "B", [("a", T0, 0.0, 5e307), ("b", T_END, 0.0, 5e307)])
+    r = _proximity(client, "span2", ["A", "B"], 1e308, until=T_END)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    _assert_strictly_serializable(body)
+    segs = body["pairs"][0]["intervals"]
+    assert len(segs) == 1
+    seg = segs[0]
+    t0 = _epoch(T0)
+    assert _epoch(seg["start"]) == pytest.approx(t0 + 6.698729810778065, abs=1e-6)
+    assert _epoch(seg["end"]) == pytest.approx(t0 + 93.30127018922193, abs=1e-6)
+    assert seg["duration_sec"] == 86.60254
+    assert seg["min_distance"] == 5e307  # 顶点处恰为 5e307（缩放后精确表示）
+
+
+def test_opposite_sign_span_joint_split_and_merge(client):
+    """±1e308 轨迹的接点规则：接点距离恰等阈值（1e308）时两段不合并；
+    阈值大一格浮点（nextafter）则接点严格满足、合并为一段。"""
+    _register(client, "span3", HUGE_SPAN_ZONE)
+    _upload(client, "A", [
+        ("a", T0, -1e308, 0.0),
+        ("m", "2026-09-30T10:00:50Z", 0.0, 0.0),
+        ("b", T_END, 1e308, 0.0),
+    ])
+    # 与 A 横向始终同位，纵向 5e307 → 1e308（接点 t=50）→ 5e307
+    _upload(client, "B", [
+        ("a", T0, -1e308, 5e307),
+        ("m", "2026-09-30T10:00:50Z", 0.0, 1e308),
+        ("b", T_END, 1e308, 5e307),
+    ])
+    # 接点恰等阈值：分成首尾相接的两段，各自保留起止、时长与最小距离
+    r = _proximity(client, "span3", ["A", "B"], 1e308, until=T_END)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    _assert_strictly_serializable(body)
+    segs = body["pairs"][0]["intervals"]
+    assert [(s["start"], s["end"], s["duration_sec"], s["min_distance"]) for s in segs] == [
+        (T0, "2026-09-30T10:00:50Z", 50.0, 5e307),
+        ("2026-09-30T10:00:50Z", T_END, 50.0, 5e307),
+    ]
+    # 阈值大一格浮点：接点严格小于阈值，合并为一段
+    r = _proximity(client, "span3", ["A", "B"], math.nextafter(1e308, math.inf), until=T_END)
+    body = r.json()
+    _assert_strictly_serializable(body)
+    segs = body["pairs"][0]["intervals"]
+    assert [(s["start"], s["end"], s["duration_sec"], s["min_distance"]) for s in segs] == [
+        (T0, T_END, 100.0, 5e307)
+    ]
+
+
+def test_opposite_sign_span_stationary_strict_threshold(client):
+    """±1e308 尺度静止两车：距离恰为 1e308 时严格小于不成立（相遇为空、
+    接触不可达）；阈值大一格浮点则整段相遇，最小距离为有限的 1e308。"""
+    _register(client, "span4", HUGE_SPAN_ZONE)
+    _upload(client, "A", [("a", T0, -5e307, 0.0), ("b", "2026-09-30T10:00:10Z", -5e307, 0.0)])
+    _upload(client, "B", [("a", T0, 5e307, 0.0), ("b", "2026-09-30T10:00:10Z", 5e307, 0.0)])
+
+    # 恰等阈值：空相遇、不可达
+    r = _proximity(client, "span4", ["A", "B"], 1e308, until="2026-09-30T10:00:10Z")
+    assert r.status_code == 200, r.text
+    assert r.json()["pairs"] == []
+    r = _tracing(client, "span4", "A", ["A", "B"], 1e308, until="2026-09-30T10:00:10Z")
+    results = {x["trip_id"]: x for x in r.json()["results"]}
+    assert results["B"]["reachable"] is False
+    assert results["B"]["arrived_at"] is None
+
+    # 阈值大一格浮点：整段相遇，最小距离有限且可序列化
+    r = _proximity(
+        client, "span4", ["A", "B"], math.nextafter(1e308, math.inf),
+        until="2026-09-30T10:00:10Z",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    _assert_strictly_serializable(body)
+    seg = body["pairs"][0]["intervals"][0]
+    assert seg["start"] == T0
+    assert seg["end"] == "2026-09-30T10:00:10Z"
+    assert seg["duration_sec"] == 10.0
+    assert seg["min_distance"] == pytest.approx(1e308, rel=1e-15)

@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 from typing import List, Sequence, Tuple
 
+from shapely.affinity import scale as _scale_geometry
 from shapely.geometry import LineString, Point, Polygon, LinearRing
 from shapely.geometry.base import BaseGeometry
 from shapely import is_valid_reason
@@ -18,6 +19,34 @@ Coord = Tuple[float, float]
 
 # 数值容差：参数区间端点小于该值的差异视为相同
 _PARAM_EPS = 1e-9
+
+# GEOS 求交在坐标模超过该量级时可能溢出（静默返回空或抛 TopologyException）；
+# 超过时先把多边形与线段按同一 2 的幂缩放再求交——线段相对区域的参数区间
+# 在等比缩放下不变，且坐标乘以 2 的幂是精确的，不引入舍入
+_INTERSECTION_SAFE_COORD = 1e200
+
+
+def _rescale_extreme_coords(
+    polygon: Polygon, p0: Coord, p1: Coord
+) -> Tuple[Polygon, Coord, Coord]:
+    """极大有限坐标下等比缩放多边形与线段端点，避免 GEOS 求交溢出。
+
+    坐标模超过 _INTERSECTION_SAFE_COORD（如 ±1e308）时，GEOS 的 intersection
+    内部乘积溢出 float64，可能静默返回空或抛 TopologyException，导致合法
+    覆盖区间丢失。等比缩放不改变线段相对区域的参数区间；缩放因子取 2 的幂，
+    坐标乘法精确（只动指数），缩放后坐标模 < 1，求交不再溢出。
+    """
+    minx, miny, maxx, maxy = polygon.bounds
+    m = max(
+        abs(minx), abs(miny), abs(maxx), abs(maxy),
+        abs(p0[0]), abs(p0[1]), abs(p1[0]), abs(p1[1]),
+    )
+    if not m > _INTERSECTION_SAFE_COORD:
+        return polygon, p0, p1
+    # 坐标均已校验为有限：取 2 的负幂使缩放后坐标模落在 [0, 1)
+    factor = math.ldexp(1.0, -math.frexp(m)[1])
+    scaled = _scale_geometry(polygon, xfact=factor, yfact=factor, origin=(0.0, 0.0))
+    return scaled, (p0[0] * factor, p0[1] * factor), (p1[0] * factor, p1[1] * factor)
 
 
 class GeometryError(ValueError):
@@ -202,7 +231,9 @@ def segment_inside_params(polygon: Polygon, p0: Coord, p1: Coord) -> List[Tuple[
     """返回移动线段 p0->p1 位于区域内部/外边界上、且不在洞边界上的参数区间。
 
     外边界计入区域；洞及其边界不计入。零长度的点接触不产生区间。
+    极大有限坐标（如 ±1e308）先按同一 2 的幂等比缩放再求交，参数区间不变。
     """
+    polygon, p0, p1 = _rescale_extreme_coords(polygon, p0, p1)
     start = Point(p0)
     end = Point(p1)
     dx, dy = p1[0] - p0[0], p1[1] - p0[1]

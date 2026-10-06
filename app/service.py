@@ -60,6 +60,19 @@ def _round_min_distance(min_d: float) -> float:
     return round(min_d, 6)
 
 
+def _lerp_finite(p0: float, p1: float, ratio: float) -> float:
+    """线性插值 p0 + (p1 - p0)·ratio（ratio ∈ [0,1]），结果必为有限值。
+
+    端点为异号极大有限值（如 -1e308 与 1e308）时差值溢出 float64，
+    直接形式会得到 Infinity/NaN（ratio=0 时 inf·0 → NaN）；此时改用数学
+    等价的凸组合 p0·(1-ratio) + p1·ratio——各分项均有限，结果不会溢出。
+    """
+    delta = p1 - p0
+    if math.isfinite(delta):
+        return p0 + delta * ratio
+    return p0 * (1.0 - ratio) + p1 * ratio
+
+
 def _finite_float(value: Fraction) -> float:
     """把非负精确值（Fraction）转换为可 JSON 序列化的有限浮点数。
 
@@ -1824,15 +1837,19 @@ class AuditService:
     def _position_at(
         points: List[Any], ts: List[float], t: float
     ) -> Tuple[float, float]:
-        """按相邻点线性插值取 t 时刻平面位置；t 须落在轨迹覆盖范围内。"""
+        """按相邻点线性插值取 t 时刻平面位置；t 须落在轨迹覆盖范围内。
+
+        端点为异号极大有限值（如 -1e308 与 1e308）时差值会溢出 float64，
+        插值改用溢出安全的等价形式，保证任意有限端点下位置均为有限值。
+        """
         idx = bisect.bisect_right(ts, t) - 1
         idx = min(max(idx, 0), len(points) - 2)
         pa, pb = points[idx], points[idx + 1]
         t0, t1 = pa["ts_epoch"], pb["ts_epoch"]
         ratio = 0.0 if t1 <= t0 else (t - t0) / (t1 - t0)
         return (
-            pa["x"] + (pb["x"] - pa["x"]) * ratio,
-            pa["y"] + (pb["y"] - pa["y"]) * ratio,
+            _lerp_finite(pa["x"], pb["x"], ratio),
+            _lerp_finite(pa["y"], pb["y"], ratio),
         )
 
     # ------------------------------------------------------------------

@@ -26,7 +26,10 @@
    比较同一时刻的平面距离，按**无序车次对**返回距离严格小于阈值的正时长区间
    （起止、持续秒数、区间最小距离），相接且连续满足条件的区间合并，瞬时触及忽略；
    距离判定对**任意有限输入**正确——极大有限坐标（如 `1e155` 米）的距离平方不再
-   溢出 float64，区间端点与最小距离按同比例缩放求解保持正确。
+   溢出 float64，区间端点与最小距离按同比例缩放求解保持正确；跨越正负范围的
+   极大有限坐标线性轨迹（端点可为 `-1e308` 与 `1e308`）插值与区域求交均为
+   溢出安全的等价形式，相遇区间、最小距离均为有限可序列化值，接触传播可达性
+   不因数值异常改变。
 8. **单车危险区风险预算复核**：现场复核单车一次作业内给定危险区集合的加权风险预算：
    请求给出车次、带时区的 UTC 半开查询时段、**非空**危险区 ID→**正且有限**风险权重映射与
    **正且有限**的加权秒数预算，可选区域修订号与轨迹版本；各区占用沿用轨迹插值、
@@ -913,6 +916,95 @@ curl -s -X POST http://localhost:8080/api/v1/zones/Z-big/contact-tracing \
 
 （响应其余字段同前例。）阈值恰为 `1e155`（等于距离）时仍为严格小于不成立：
 相遇复核返回 `"pairs": []`，接触追踪中 `truck-h2` 标记为 `reachable: false`。
+
+### 跨越正负范围的极大有限坐标（±1e308 线性轨迹）
+
+轨迹点按时间线性插值时，端点可以是 `-1e308` 与 `1e308` 这类**异号极大有限坐标**：
+此时两点差值（`2e308`）本身已超出 float64 有限范围。服务对这类输入同样保证
+数值正确——插值改用溢出安全的等价形式（差值溢出时按凸组合求值），区域求交
+先把几何与轨迹按同一 2 的幂等比缩放（参数区间在等比缩放下不变，且乘以 2 的幂
+不引入舍入），相对量求解沿用同比例缩放后的抛物线解析。**判定语义完全不变**：
+仅距离严格小于阈值的正时长计入、半开时间窗口、接点合并规则同上；返回的区间
+与最小距离均为**有限且可序列化**的数值，接触传播沿用同一修复后的相遇区间，
+可达性不因数值异常改变。
+
+示例场景：`Z-span` 全天生效；`truck-s1` 自 `(-1e308, 0)` 驶向 `(1e308, 0)`，
+`truck-s2` 同时反向对开，两车在 t=50s 处相遇、距离为 0。阈值 `1e308` 时
+相遇区间为 t ∈ (25, 75) 秒：
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/zones \
+  -H 'Content-Type: application/json' \
+  -d '{"zone_id":"Z-span","exterior":[[-1.5e308,-1.5e308],[1.5e308,-1.5e308],[1.5e308,1.5e308],[-1.5e308,1.5e308]],
+       "holes":[],"windows":[{"start":"2026-09-30T00:00:00Z","end":"2026-10-01T00:00:00Z"}]}'
+
+curl -s -X POST http://localhost:8080/api/v1/trips/truck-s1/points \
+  -H 'Content-Type: application/json' \
+  -d '{"points":[
+        {"point_id":"a","ts":"2026-09-30T10:00:00Z","x":-1e308,"y":0},
+        {"point_id":"b","ts":"2026-09-30T10:01:40Z","x":1e308,"y":0}]}'
+
+curl -s -X POST http://localhost:8080/api/v1/trips/truck-s2/points \
+  -H 'Content-Type: application/json' \
+  -d '{"points":[
+        {"point_id":"a","ts":"2026-09-30T10:00:00Z","x":1e308,"y":0},
+        {"point_id":"b","ts":"2026-09-30T10:01:40Z","x":-1e308,"y":0}]}'
+
+curl -s -X POST http://localhost:8080/api/v1/zones/Z-span/proximity \
+  -H 'Content-Type: application/json' \
+  -d '{"trip_ids":["truck-s1","truck-s2"],
+       "since":"2026-09-30T10:00:00Z","until":"2026-09-30T10:01:40Z",
+       "max_distance":1e308}'
+```
+
+```json
+{
+  "zone_id": "Z-span",
+  "since": "2026-09-30T10:00:00Z",
+  "until": "2026-09-30T10:01:40Z",
+  "max_distance": 1e+308,
+  "trips": [
+    {"trip_id": "truck-s1", "track_version": 1, "point_count": 2},
+    {"trip_id": "truck-s2", "track_version": 1, "point_count": 2}
+  ],
+  "pairs": [
+    {
+      "trip_ids": ["truck-s1", "truck-s2"],
+      "intervals": [
+        {"start": "2026-09-30T10:00:25Z", "end": "2026-09-30T10:01:15Z",
+         "duration_sec": 50.0, "min_distance": 0.0}
+      ]
+    }
+  ]
+}
+```
+
+接触传播追踪沿同一相遇区间判定可传递性，`truck-s2` 在相遇段起点（10:00:25）
+可达（1 跳）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/zones/Z-span/contact-tracing \
+  -H 'Content-Type: application/json' \
+  -d '{"source_trip_id":"truck-s1","trip_ids":["truck-s1","truck-s2"],
+       "since":"2026-09-30T10:00:00Z","until":"2026-09-30T10:01:40Z",
+       "max_distance":1e308}'
+```
+
+```json
+{
+  "results": [
+    {"trip_id": "truck-s1", "reachable": true, "arrived_at": "2026-09-30T10:00:00Z",
+     "hops": 0, "chain": ["truck-s1"]},
+    {"trip_id": "truck-s2", "reachable": true, "arrived_at": "2026-09-30T10:00:25Z",
+     "hops": 1, "chain": ["truck-s1", "truck-s2"]}
+  ]
+}
+```
+
+（响应其余字段同前例。）严格小于语义在该尺度下同样保持：两车静止相距恰
+`1e308`（如 `(-5e307, 0)` 与 `(5e307, 0)`）、阈值恰为 `1e308` 时相遇复核返回
+`"pairs": []`、接触追踪标记不可达；阈值再大一格浮点（`nextafter(1e308, inf)`）
+才计入整段相遇，最小距离为有限的 `1e308`。
 
 ## 事故后危险区内车次间接触传播追踪
 
