@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import math
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from shapely.geometry import LineString, Point, Polygon, LinearRing
 from shapely.geometry.base import BaseGeometry
@@ -57,6 +57,13 @@ def _normalize_ring(ring: Sequence[Sequence[float]], name: str) -> List[Coord]:
     return pts
 
 
+def _validation_scale(points: Sequence[Coord]) -> float:
+    """合法但极大（>1e100 模长）的坐标在 GEOS 求面积/叉积时会溢出为
+    inf/NaN；校验时同比例缩放到 O(1)（相似变换不改变合法性与拓扑）。"""
+    magnitude = max((max(abs(x), abs(y)) for x, y in points), default=0.0)
+    return magnitude if magnitude > _GEOS_SAFE_SCALE else 1.0
+
+
 def build_polygon(
     exterior: Sequence[Sequence[float]],
     holes: Sequence[Sequence[Sequence[float]]] | None = None,
@@ -72,26 +79,37 @@ def build_polygon(
     for index, hole in enumerate(holes or []):
         label = f"洞#{index + 1}"
         hpts = _normalize_ring(hole, label)
+        hole_pts.append(hpts)
+
+    # 校验几何（含面积）用同比例缩放副本：极大合法有限坐标（±1e308 量级）
+    # 在 GEOS 内部平方/叉积会溢出 inf/NaN，相似缩放下合法性/包含关系不变
+    scale = _validation_scale(
+        ext_pts + [pt for hpts in hole_pts for pt in hpts]
+    )
+    ext_check = [(x / scale, y / scale) for x, y in ext_pts]
+    holes_check = [[(x / scale, y / scale) for x, y in hpts] for hpts in hole_pts]
+
+    for index, hpts in enumerate(holes_check):
+        label = f"洞#{index + 1}"
         ring = LinearRing(hpts)
         if not ring.is_valid:
             raise GeometryError(f"{label}自交或退化，不是合法的简单环: {is_valid_reason(ring)}")
-        hole_pts.append(hpts)
         hole_geoms.append(ring)
 
-    ext_ring = LinearRing(ext_pts)
+    ext_ring = LinearRing(ext_check)
     if not ext_ring.is_valid:
         raise GeometryError(f"外边界自交或退化，不是合法的简单环: {is_valid_reason(ext_ring)}")
 
-    polygon = Polygon(ext_pts, hole_pts)
+    polygon_check = Polygon(ext_check, holes_check)
 
     # Polygon 构造会静默修复部分非法输入（如洞在外部），因此显式检查
-    if not polygon.is_valid:
-        raise GeometryError(f"多边形不合法: {is_valid_reason(polygon)}")
-    if polygon.is_empty or polygon.area <= 0:
+    if not polygon_check.is_valid:
+        raise GeometryError(f"多边形不合法: {is_valid_reason(polygon_check)}")
+    if polygon_check.is_empty or polygon_check.area <= 0:
         raise GeometryError("多边形面积必须为正")
 
-    outer = Polygon(ext_pts)
-    for index, hpts in enumerate(hole_pts):
+    outer = Polygon(ext_check)
+    for index, hpts in enumerate(holes_check):
         label = f"洞#{index + 1}"
         hole_poly = Polygon(hpts)
         if hole_poly.area <= 0:
@@ -108,7 +126,7 @@ def build_polygon(
             if hole_geoms[i].intersects(hole_geoms[j]):
                 raise GeometryError(f"洞#{i + 1} 与 洞#{j + 1} 相交或重叠，洞之间必须互不相交")
 
-    # 再构造一次保证 Shapely 内部一致
+    # 返回原始坐标构造的多边形（存储/查询用），再做一次内部一致性检查
     polygon = Polygon(ext_pts, hole_pts)
     if not polygon.is_valid:
         raise GeometryError(f"多边形不合法: {is_valid_reason(polygon)}")
@@ -198,11 +216,62 @@ def _params_of_piece(piece: LineString, p0: Point, p1: Point, vx: float, vy: flo
     return ta, tb
 
 
+# GEOS（float64）内部会对坐标做平方/叉积：分量模长超过 ~1e154 时中间量
+# 溢出为 inf/NaN（即使输入均为合法有限值，如端点 -1e308→1e308 的线段）。
+# 超过该模长时把多边形与线段同比例缩放到 O(1) 再求交，拓扑/参数不变。
+_GEOS_SAFE_SCALE = 1e100
+
+
+def _scaled_polygon_and_segment(
+    polygon: Polygon, p0: Coord, p1: Coord
+) -> Tuple[Polygon, Coord, Coord, float]:
+    """极大坐标模长时，把多边形（含洞环）与线段同除一个正比例。
+
+    缩放是相似变换：线段与区域的相交拓扑不变，交点在线段上的参数 t∈[0,1]
+    也不变（``_params_of_piece`` 只做比值），因此调用方得到的参数区间与
+    不缩放时数学上一致，但 GEOS 内部不再溢出/产生 NaN。
+
+    缩放下塌缩为重复点的洞环剔除：其真实尺寸小到任何正时长经过都无法
+    在 float64 时间上体现，丢弃不影响可见语义。
+    """
+    rings = [list(polygon.exterior.coords)]
+    rings.extend(list(ring.coords) for ring in polygon.interiors)
+    magnitude = max(
+        (abs(x) for ring in rings for x, _y in ring),
+        default=0.0,
+    )
+    magnitude = max(magnitude, abs(p0[0]), abs(p0[1]), abs(p1[0]), abs(p1[1]))
+    if magnitude <= _GEOS_SAFE_SCALE:
+        return polygon, p0, p1, 1.0
+    scale = magnitude
+
+    def _scaled_ring(ring: Sequence[Coord]) -> Optional[List[Coord]]:
+        coords = [(x / scale, y / scale) for x, y in ring]
+        return coords if len(set(coords)) >= 4 else None
+
+    ext = _scaled_ring(list(polygon.exterior.coords))
+    sp0, sp1 = (p0[0] / scale, p0[1] / scale), (p1[0] / scale, p1[1] / scale)
+    if ext is None or not all(math.isfinite(v) for pt in (sp0, sp1) for v in pt):
+        # 外环都缩没了或线段仍非有限：任何正时长子区间在 float64 下都不可表示
+        return None, sp0, sp1, scale
+    holes: List[List[Coord]] = []
+    for ring in polygon.interiors:
+        scaled_ring = _scaled_ring(list(ring.coords))
+        if scaled_ring is not None:
+            holes.append(scaled_ring)
+    return Polygon(ext, holes), sp0, sp1, scale
+
+
 def segment_inside_params(polygon: Polygon, p0: Coord, p1: Coord) -> List[Tuple[float, float]]:
     """返回移动线段 p0->p1 位于区域内部/外边界上、且不在洞边界上的参数区间。
 
     外边界计入区域；洞及其边界不计入。零长度的点接触不产生区间。
+    端点分量允许取任意合法有限值（含 ±1e308 量级跨越）：极大模长时按
+    比例缩放后再交给 GEOS，避免内部平方/叉积溢出产生空区间或 NaN。
     """
+    polygon, p0, p1, _scale = _scaled_polygon_and_segment(polygon, p0, p1)
+    if polygon is None:
+        return []
     start = Point(p0)
     end = Point(p1)
     dx, dy = p1[0] - p0[0], p1[1] - p0[1]

@@ -4,6 +4,11 @@
 曾导致相遇漏报、接触追踪误判不可达。相遇区间计算对相对位置、相对速度与阈值
 按同一比例缩放后再解同一抛物线：有限输入的距离判定、区间端点与最小距离正确；
 仅距离严格小于阈值的正时长计入，恰等阈值或瞬时接触不计，接点不满足条件不合并。
+
+端点本身可取合法极大有限值 ±1e308：相邻轨迹点线性插值时 (pb-pa) 会溢出为
+inf（pa + inf·r 把真实有限的中点算成 inf/NaN），GEOS 对 1e308 量级线段求交
+也会在内部平方/叉积处溢出产生空覆盖。插值改走凸组合、几何求交按坐标量级
+同比例缩放后，跨越正负范围的线性轨迹相遇区间、最小距离仍为有限值且正确。
 """
 import math
 
@@ -250,3 +255,163 @@ def test_normal_scale_behavior_unchanged(client):
     assert seg["end"] == "2026-09-30T10:01:40Z"
     assert seg["duration_sec"] == 37.5
     assert seg["min_distance"] == 10.0
+
+
+def _assert_all_finite(obj):
+    """递归断言响应中不出现 Infinity/NaN（保证 JSON 可序列化）。"""
+    if isinstance(obj, float):
+        assert math.isfinite(obj), obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _assert_all_finite(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            _assert_all_finite(v)
+
+
+def test_endpoints_pm_1e308_crossing_sign_range_encounter(client):
+    """端点 -1e308 → 1e308 线性跨越正负范围：段内正时长相遇必须报出。
+
+    相对运动分量（2e308 / 10 秒）与端点差均超出常规缩放路径，凸组合插值与
+    缩放几何保证覆盖区间完整；阈值圆在段前段后截断，相遇区间端点与区间
+    最小距离均为有限值。
+    """
+    _register(
+        client, "span1",
+        [[-1.5e308, -1.5e308], [1.5e308, -1.5e308], [1.5e308, 1.5e308], [-1.5e308, 1.5e308]],
+    )
+    # A: (-1e308, 0) → (1e308, 100)；B: (-1e308, 0) → (1e308, 0)，10 秒
+    # 相对 y = 10t，严格小于阈值 50 ⟺ t ∈ [0, 5)
+    _upload(client, "S1", [
+        ("a", T0, -1e308, 0.0),
+        ("b", "2026-09-30T10:00:10Z", 1e308, 100.0),
+    ])
+    _upload(client, "S2", [
+        ("a", T0, -1e308, 0.0),
+        ("b", "2026-09-30T10:00:10Z", 1e308, 0.0),
+    ])
+    r = _proximity(client, "span1", ["S1", "S2"], 50.0, until="2026-09-30T10:00:10Z")
+    assert r.status_code == 200, r.text
+    _assert_all_finite(r.json())
+    seg = r.json()["pairs"][0]["intervals"][0]
+    assert seg["start"] == T0
+    assert seg["end"] == "2026-09-30T10:00:05Z"
+    assert seg["duration_sec"] == 5.0
+    assert seg["min_distance"] == 0.0
+
+    # 严格小于：阈值恰为段末距离 50 时不计段末（区间仍在 [0,5)，正时长保留）
+    # 接触传播沿用同一相遇区间：S2 在查询起点即可达
+    r = _tracing(client, "span1", "S1", ["S1", "S2"], 50.0, until="2026-09-30T10:00:10Z")
+    assert r.status_code == 200, r.text
+    _assert_all_finite(r.json())
+    results = {x["trip_id"]: x for x in r.json()["results"]}
+    assert results["S2"]["reachable"] is True
+    assert results["S2"]["arrived_at"] == T0
+    assert results["S2"]["hops"] == 1
+    assert results["S2"]["chain"] == ["S1", "S2"]
+
+
+def test_pm_1e308_segment_interior_cut_by_window_boundary(client):
+    """生效窗口边界落在 ±1e308 线性段内部：段内凸组合插值给出有限位置，
+    相遇区间从窗口半开起点开始（此前两车虽近但窗口未生效，不计）。"""
+    r = client.post(
+        "/api/v1/zones",
+        json={
+            "zone_id": "span2",
+            "exterior": [[-1.5e308, -1.5e308], [1.5e308, -1.5e308],
+                         [1.5e308, 1.5e308], [-1.5e308, 1.5e308]],
+            "holes": [],
+            "windows": [{"start": "2026-09-30T10:00:02Z", "end": "2026-09-30T10:00:11Z"}],
+        },
+    )
+    assert r.status_code in (200, 201), r.text
+    _upload(client, "W1", [
+        ("a", T0, -1e308, 0.0),
+        ("b", "2026-09-30T10:00:10Z", 1e308, 100.0),
+    ])
+    _upload(client, "W2", [
+        ("a", T0, -1e308, 0.0),
+        ("b", "2026-09-30T10:00:10Z", 1e308, 0.0),
+    ])
+    r = _proximity(client, "span2", ["W1", "W2"], 50.0, until="2026-09-30T10:00:10Z")
+    assert r.status_code == 200, r.text
+    _assert_all_finite(r.json())
+    seg = r.json()["pairs"][0]["intervals"][0]
+    assert seg["start"] == "2026-09-30T10:00:02Z"  # 半开窗口起点
+    assert seg["end"] == "2026-09-30T10:00:05Z"
+    assert seg["duration_sec"] == 3.0
+    assert seg["min_distance"] == 20.0  # t=2 处相对 y=20
+
+    r = _tracing(client, "span2", "W1", ["W1", "W2"], 50.0, until="2026-09-30T10:00:10Z")
+    _assert_all_finite(r.json())
+    results = {x["trip_id"]: x for x in r.json()["results"]}
+    assert results["W2"]["reachable"] is True
+    assert results["W2"]["arrived_at"] == "2026-09-30T10:00:02Z"
+
+
+def test_pm_1e308_segments_joined_at_sample_strict_threshold_split(client):
+    """±1e308 量级多段轨迹在采样接点处距离恰等阈值：两段不合并（区间合并
+    语义不变）；阈值大一格浮点则合并为一段，全部数值有限。"""
+    _register(
+        client, "span3",
+        [[-1.5e308, -1.5e308], [1.5e308, -1.5e308], [1.5e308, 1.5e308], [-1.5e308, 1.5e308]],
+    )
+    # 两车 x 轨迹完全相同（接点 t=5 位于中点）；y 偏移在接点恰为 1e155
+    _upload(client, "Jx1", [
+        ("a", T0, -1e308, 0.0),
+        ("m", "2026-09-30T10:00:05Z", 0.0, 0.0),
+        ("b", "2026-09-30T10:00:10Z", 1e308, 0.0),
+    ])
+    _upload(client, "Jx2", [
+        ("a", T0, -1e308, 0.9e155),
+        ("m", "2026-09-30T10:00:05Z", 0.0, 1e155),
+        ("b", "2026-09-30T10:00:10Z", 1e308, 0.9e155),
+    ])
+    r = _proximity(client, "span3", ["Jx1", "Jx2"], 1e155, until="2026-09-30T10:00:10Z")
+    assert r.status_code == 200, r.text
+    _assert_all_finite(r.json())
+    segs = r.json()["pairs"][0]["intervals"]
+    assert [(s["start"], s["end"], s["duration_sec"]) for s in segs] == [
+        (T0, "2026-09-30T10:00:05Z", 5.0),
+        ("2026-09-30T10:00:05Z", "2026-09-30T10:00:10Z", 5.0),
+    ]
+    r = _proximity(
+        client, "span3", ["Jx1", "Jx2"], math.nextafter(1e155, math.inf),
+        until="2026-09-30T10:00:10Z",
+    )
+    _assert_all_finite(r.json())
+    segs = r.json()["pairs"][0]["intervals"]
+    assert len(segs) == 1
+    assert segs[0]["start"] == T0
+    assert segs[0]["end"] == "2026-09-30T10:00:10Z"
+    assert segs[0]["duration_sec"] == 10.0
+    assert segs[0]["min_distance"] == 9e154
+
+
+def test_pm_1e308_stationary_small_offset_encounter(client):
+    """±1e308 端点上同向跨越、垂直偏移为常规小量（平方下溢路径）：整段相遇，
+    最小距离为真实小值而非 0 或 inf/NaN。"""
+    _register(
+        client, "span4",
+        [[-1.5e308, -1.5e308], [1.5e308, -1.5e308], [1.5e308, 1.5e308], [-1.5e308, 1.5e308]],
+    )
+    _upload(client, "P1", [
+        ("a", T0, -1e308, 0.0),
+        ("b", "2026-09-30T10:00:10Z", 1e308, 0.0),
+    ])
+    _upload(client, "P2", [
+        ("a", T0, -1e308, 20.0),
+        ("b", "2026-09-30T10:00:10Z", 1e308, 20.0),
+    ])
+    r = _proximity(client, "span4", ["P1", "P2"], 25.0, until="2026-09-30T10:00:10Z")
+    assert r.status_code == 200, r.text
+    # 原始 JSON 文本中也不得出现 Infinity/NaN（FastAPI 默认序列化会抛错或写出非法 JSON）
+    assert "Infinity" not in r.text and "NaN" not in r.text
+    seg = r.json()["pairs"][0]["intervals"][0]
+    assert seg["start"] == T0
+    assert seg["end"] == "2026-09-30T10:00:10Z"
+    assert seg["duration_sec"] == 10.0
+    assert seg["min_distance"] == 20.0
+    # 阈值恰等 20：严格小于不成立
+    r = _proximity(client, "span4", ["P1", "P2"], 20.0, until="2026-09-30T10:00:10Z")
+    assert r.json()["pairs"] == []

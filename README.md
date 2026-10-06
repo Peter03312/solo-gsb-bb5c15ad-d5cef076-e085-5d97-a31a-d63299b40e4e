@@ -914,6 +914,101 @@ curl -s -X POST http://localhost:8080/api/v1/zones/Z-big/contact-tracing \
 （响应其余字段同前例。）阈值恰为 `1e155`（等于距离）时仍为严格小于不成立：
 相遇复核返回 `"pairs": []`，接触追踪中 `truck-h2` 标记为 `reachable: false`。
 
+#### 端点 ±1e308 线性跨越正负范围（差值溢出安全）
+
+轨迹端点本身可取到合法极大有限值 `-1e308` 与 `1e308`。相邻点线性插值时
+端点差 `(1e308)-(-1e308)=2e308` 会溢出为 `Infinity`，旧式
+`p0 + (p1-p0)·r` 把真实有限的插值（如中点 0）算成 `Infinity/NaN`；GEOS
+对 `1e308` 量级线段求交时内部平方/叉积同样溢出，产生空覆盖。修复后：
+段内插值改走凸组合 `p0·(1-r) + p1·r`（同一线性轨迹、不溢出），几何求交按
+坐标量级同比例缩放，相遇抛物线改以向量 `hypot`/叉积的稳定形式求解——
+相遇区间不被漏报，区间端点与最小距离始终是有限值（无 `Infinity/NaN`，
+JSON 可正常序列化）。严格小于阈值、半开时间窗口、接点不满足不合并等
+语义不变；接触传播沿用修复后的相遇区间，可达性不随数值异常改变。
+
+示例：`Z-span` 全天生效；`truck-s1` 与 `truck-s2` 都在 10 秒内从
+`-1e308` 线性移动到 `1e308`，垂直间距由 0 线性拉开到 100 米，阈值 50 米。
+真实相对距离即 `10t` 米，严格小于 50 米 ⟺ `t ∈ [0,5)`：
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/zones \
+  -H 'Content-Type: application/json' \
+  -d '{"zone_id":"Z-span","exterior":[[-1.5e308,-1.5e308],[1.5e308,-1.5e308],[1.5e308,1.5e308],[-1.5e308,1.5e308]],
+       "holes":[],"windows":[{"start":"2026-09-30T10:00:02Z","end":"2026-09-30T10:00:11Z"}]}'
+
+curl -s -X POST http://localhost:8080/api/v1/trips/truck-s1/points \
+  -H 'Content-Type: application/json' \
+  -d '{"points":[
+        {"point_id":"a","ts":"2026-09-30T10:00:00Z","x":-1e308,"y":0},
+        {"point_id":"b","ts":"2026-09-30T10:00:10Z","x":1e308,"y":100}]}'
+
+curl -s -X POST http://localhost:8080/api/v1/trips/truck-s2/points \
+  -H 'Content-Type: application/json' \
+  -d '{"points":[
+        {"point_id":"a","ts":"2026-09-30T10:00:00Z","x":-1e308,"y":0},
+        {"point_id":"b","ts":"2026-09-30T10:00:10Z","x":1e308,"y":0}]}'
+
+curl -s -X POST http://localhost:8080/api/v1/zones/Z-span/proximity \
+  -H 'Content-Type: application/json' \
+  -d '{"trip_ids":["truck-s1","truck-s2"],
+       "since":"2026-09-30T10:00:00Z","until":"2026-09-30T10:00:10Z",
+       "max_distance":50}'
+```
+
+```json
+{
+  "zone_id": "Z-span",
+  "since": "2026-09-30T10:00:00Z",
+  "until": "2026-09-30T10:00:10Z",
+  "max_distance": 50.0,
+  "trips": [
+    {"trip_id": "truck-s1", "track_version": 1, "point_count": 2},
+    {"trip_id": "truck-s2", "track_version": 1, "point_count": 2}
+  ],
+  "pairs": [
+    {
+      "trip_ids": ["truck-s1", "truck-s2"],
+      "intervals": [
+        {"start": "2026-09-30T10:00:02Z", "end": "2026-09-30T10:00:05Z",
+         "duration_sec": 3.0, "min_distance": 20.0}
+      ]
+    }
+  ]
+}
+```
+
+半开生效窗口从 `10:00:02` 开始，其边界落在 ±1e308 线性段内部：相遇区间
+从窗口起点开始（此前两车虽近但窗口未生效，不计），窗口起点处真实间距
+20 米即区间最小距离，全部数值均为有限值。若窗口全天生效
+（`[2026-09-30T00:00:00Z, 2026-10-01T00:00:00Z)`），同一查询则返回
+整段 `10:00:00 → 10:00:05`、`duration_sec = 5.0`、`min_distance = 0.0`
+（真实相对距离即 `10t` 米，严格小于 50 米 ⟺ `t ∈ [0,5)`）。接触传播
+追踪沿修复后的相遇区间接续，`truck-s2` 在窗口起点 `10:00:02` 即 1 跳可达：
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/zones/Z-span/contact-tracing \
+  -H 'Content-Type: application/json' \
+  -d '{"source_trip_id":"truck-s1","trip_ids":["truck-s1","truck-s2"],
+       "since":"2026-09-30T10:00:00Z","until":"2026-09-30T10:00:10Z",
+       "max_distance":50}'
+```
+
+```json
+{
+  "results": [
+    {"trip_id": "truck-s1", "reachable": true, "arrived_at": "2026-09-30T10:00:00Z",
+     "hops": 0, "chain": ["truck-s1"]},
+    {"trip_id": "truck-s2", "reachable": true, "arrived_at": "2026-09-30T10:00:02Z",
+     "hops": 1, "chain": ["truck-s1", "truck-s2"]}
+  ]
+}
+```
+
+异号极大坐标但真实距离超出 float64 有限范围时（如两车分别静止在
+`1e308` 与 `-1e308`，相距 `2e308`），必然不小于任何有限阈值，仍合法
+返回 `"pairs": []`（接触追踪 `reachable: false`），而不是因溢出报错或
+写出含 `Infinity/NaN` 的非法响应。
+
 ## 事故后危险区内车次间接触传播追踪
 
 `POST /api/v1/zones/{zone_id}/contact-tracing` 在事故后沿**可传递的近距离相遇**追踪危险区内

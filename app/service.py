@@ -60,6 +60,14 @@ def _round_min_distance(min_d: float) -> float:
     return round(min_d, 6)
 
 
+def _finite_or_clamp(value: float) -> float:
+    """响应数值兜底：任何非有限值（inf/NaN）都钳为最大有限浮点，
+    保证 JSON 响应始终可序列化（正常路径不会产生非有限值）。"""
+    if math.isfinite(value):
+        return value
+    return sys.float_info.max
+
+
 def _finite_float(value: Fraction) -> float:
     """把非负精确值（Fraction）转换为可 JSON 序列化的有限浮点数。
 
@@ -1581,8 +1589,8 @@ class AuditService:
                             {
                                 "start": _iso_z(datetime.fromtimestamp(s, timezone.utc)),
                                 "end": _iso_z(datetime.fromtimestamp(e, timezone.utc)),
-                                "duration_sec": round(e - s, 6),
-                                "min_distance": _round_min_distance(min_d),
+                                "duration_sec": _finite_or_clamp(round(e - s, 6)),
+                                "min_distance": _finite_or_clamp(_round_min_distance(min_d)),
                             }
                             for s, e, min_d in intervals
                         ],
@@ -1703,10 +1711,11 @@ class AuditService:
         rx0, ry0 = ax0 - bx0, ay0 - by0
         dvx, dvy = (ax1 - bx1) - rx0, (ay1 - by1) - ry0
         # 极大有限坐标/阈值下平方会溢出 float64（如 1e155 的平方 → inf），
-        # 极小时平方会下溢为 0——都会使距离判定、区间端点与最小距离出错；
-        # 此时改走同比例缩放求解（数学上是同一条抛物线，根不变）
+        # 极小时平方会下溢为 0，异号极大端点的相对差值本身会溢出为 inf/NaN
+        # ——都会使距离判定、区间端点与最小距离出错；此时改走按相对运动量级
+        # 缩放、以向量几何量（hypot/叉积）求解的等价路径（同一条抛物线）。
         m = max(abs(rx0), abs(ry0), abs(dvx), abs(dvy), max_distance)
-        if not 1e-76 <= m <= 1e76:
+        if not math.isfinite(m) or not 1e-76 <= m <= 1e76:
             return self._close_interval_on_piece_scaled(
                 (ax0, ay0, ax1, ay1),
                 (bx0, by0, bx1, by1),
@@ -1714,7 +1723,6 @@ class AuditService:
                 a,
                 b,
                 max_distance,
-                m,
             )
         qa = dvx * dvx + dvy * dvy
         qc = rx0 * rx0 + ry0 * ry0 - max_distance * max_distance
@@ -1758,23 +1766,36 @@ class AuditService:
         a: float,
         b: float,
         max_distance: float,
-        m: float,
     ) -> Optional[Tuple[float, float, float]]:
-        """极大/极小有限量下的抛物线求解：同比例缩放，避免平方溢出/下溢。
+        """极大/极小/异号溢出有限量下的相遇子区间求解，保证结果全有限。
 
-        相对位置、相对速度与阈值同除一个正比例 scale 后，|r(u)|² < d² 的根
-        （相遇区间端点）在数学上不变，最小距离再乘回 scale；缩放后各量不超过
-        O(1)，平方不会溢出也不会下溢。相对差值本身溢出 float64（坐标异号
-        极大）时，改按两车位置坐标与阈值的最大模缩放，并在缩放后的坐标系里
-        重新求相对量。最小距离只在相遇区间存在时返回，真实值必然小于阈值
-        （有限），乘回不会溢出；仍以最大有限浮点值兜底保证可序列化。
+        输入坐标均为合法有限值（端点可达 ±1e308 量级），但相减得到的相对
+        量可能溢出为 inf/NaN。求解策略：
+
+        1. 相对量直接可表示（即使平方会溢出）时，以「相对运动量级」为比例
+           缩放——相对位置/相对速度除同一正比例，抛物线的根（区间端点）不
+           变，最小距离乘回；缩放量不超过 O(1)，平方既不溢出也不下溢。
+        2. 相对差值本身溢出（异号极大）时，改在按**位置量级**缩放后的坐标
+           系里重新求相对量；此时真实距离已超出 float64 有限范围，必然不
+           小于任何有限阈值，仅在几何上确有穿入时给出（必然短于正时长
+           判定的）瞬时触及，语义上等价于无相遇。
+        3. 全程以 math.hypot 与二维叉积代替“平方和开方/交叉项”，避免
+           1e308×1e308 量级的乘积再次溢出；sqrt(1-x²) 按比值或乘积两种
+           稳定形式计算，杜绝 0/0 与 NaN。
         """
         rx0, ry0, dvx, dvy = rel
-        if math.isfinite(m):
-            scale = m
+        if all(math.isfinite(v) for v in rel):
+            # 相对量可表示：按相对运动量级缩放（阈值仅参与缩放比例，
+            # 不与任何量相乘后再平方）
+            scale = max(abs(rx0), abs(ry0), abs(dvx), abs(dvy), max_distance)
             srx0, sry0 = rx0 / scale, ry0 / scale
             sdvx, sdvy = dvx / scale, dvy / scale
         else:
+            # 相对差值溢出：在按位置量级缩放后的坐标系里重求相对量。
+            # 缩放后的 r0/v 仍完整保留相对轨迹（|r0| 可达 2、|v| 可达 4），
+            # 故仍按同一抛物线求解；只是把真实距离乘回 scale 时会超出
+            # float64 有限范围——此类穿入即使几何上存在，真实距离也必然
+            # 不小于任何有限阈值，仅可能给出短于正时长判定的瞬时触及。
             ax0, ay0, ax1, ay1 = pos_a
             bx0, by0, bx1, by1 = pos_b
             scale = max(
@@ -1786,21 +1807,57 @@ class AuditService:
             srx1, sry1 = ax1 / scale - bx1 / scale, ay1 / scale - by1 / scale
             sdvx, sdvy = srx1 - srx0, sry1 - sry0
         sd = max_distance / scale
-        qa = sdvx * sdvx + sdvy * sdvy
-        qc = srx0 * srx0 + sry0 * sry0 - sd * sd
-        if qa == 0.0:
-            # 相对静止：整段要么全满足要么全不满足
-            if qc < 0.0:
-                return (a, b, min(scale * math.hypot(srx0, sry0), sys.float_info.max))
+        speed = math.hypot(sdvx, sdvy)  # 缩放后的相对速率，非负有限
+
+        def _pos(u: float) -> Tuple[float, float]:
+            return srx0 + sdvx * u, sry0 + sdvy * u
+
+        def _real_min(u: float) -> float:
+            """区间内真实最小距离；超出 float64 有限范围时记 inf。"""
+            rx, ry = _pos(u)
+            real = scale * math.hypot(rx, ry)
+            return real if math.isfinite(real) else math.inf
+
+        if speed == 0.0:
+            # 相对静止：整段要么全满足要么全不满足（严格小于，平方比较防开方误差）
+            stationary = (
+                math.isfinite(srx0)
+                and math.isfinite(sry0)
+                and _dist_strictly_less(srx0, sry0, sd)
+            )
+            if stationary:
+                real = _real_min(0.0)
+                if not math.isfinite(real):
+                    return None  # 真实距离超出 float64：不可能严格小于有限阈值
+                return (a, b, min(real, sys.float_info.max))
             return None
-        qb = 2.0 * (srx0 * sdvx + sry0 * sdvy)
-        disc = qb * qb - 4.0 * qa * qc
-        if disc <= 0.0:
-            return None  # 始终不满足，或仅瞬时相切（零时长触及忽略）
-        root = math.sqrt(disc)
-        u1 = (-qb - root) / (2.0 * qa)
-        u2 = (-qb + root) / (2.0 * qa)
-        lo_u, hi_u = max(u1, 0.0), min(u2, 1.0)
+
+        # r(u) = r0 + v·u：顶点 u* = -(r0·v)/|v|²；
+        # 顶点处到直线的垂直距离 perp = |r0×v|/|v|（叉积代替交叉项，不溢出）。
+        # 缩放坐标下 |r0|、|v| 有界，点积/叉积均为有限值；即便原始相对差
+        # 溢出（u* 可能落出 [0,1]），也照常求根，由区间裁剪与正时长判定过滤。
+        u_star = -(srx0 * sdvx + sry0 * sdvy) / (speed * speed)
+        perp = abs(srx0 * sdvy - sry0 * sdvx) / speed
+        if not math.isfinite(u_star) or not math.isfinite(perp):
+            return None
+        if not (perp < sd):
+            # 不相切（perp 恰等阈值仅瞬时触及，严格小于不成立）
+            return None
+
+        # 顶点两侧半宽（u 轴）：sqrt(d²-perp²)/speed，取数值稳定形式：
+        # perp 小时用 sqrt(1-(perp/d)²) 防 d²-perp² 溢出/抵消；
+        # perp 接近 d 时用 sqrt((d-perp)(d+perp)) 防 1-比值² 抵消成 0。
+        ratio = perp / sd
+        if ratio <= 0.5:
+            factor = math.sqrt(max(0.0, 1.0 - ratio * ratio))
+            half = sd * factor / speed
+        else:
+            half = math.sqrt(max(0.0, (sd - perp) * (sd + perp))) / speed
+        if not math.isfinite(half):
+            half = 2.0  # 半宽已覆盖整个 u∈[0,1] 仍溢出：按整段处理
+
+        lo_u = max(0.0, u_star - half)
+        hi_u = min(1.0, u_star + half)
         if hi_u <= lo_u:
             return None
         s = a + lo_u * (b - a)
@@ -1808,31 +1865,41 @@ class AuditService:
         if e - s <= self.min_duration:
             return None
 
-        def _dist(u: float) -> float:
-            rx = srx0 + sdvx * u
-            ry = sry0 + sdvy * u
-            return scale * math.hypot(rx, ry)
-
-        u_star = -qb / (2.0 * qa)  # 抛物线顶点：距离最小处
-        if lo_u <= u_star <= hi_u:
-            min_d = _dist(u_star)
-        else:
-            min_d = min(_dist(lo_u), _dist(hi_u))
-        return (s, e, min(min_d, sys.float_info.max))
+        u_star_clamped = min(max(u_star, lo_u), hi_u)
+        real_min = _real_min(u_star_clamped)
+        if not math.isfinite(real_min):
+            # 顶点真实距离已超出 float64 有限范围：整个子区间内真实距离均
+            # 不小于任何有限阈值（出现在按位置量级缩放的溢出分支）
+            return None
+        return (s, e, min(real_min, sys.float_info.max))
 
     @staticmethod
     def _position_at(
         points: List[Any], ts: List[float], t: float
     ) -> Tuple[float, float]:
-        """按相邻点线性插值取 t 时刻平面位置；t 须落在轨迹覆盖范围内。"""
+        """按相邻点线性插值取 t 时刻平面位置；t 须落在轨迹覆盖范围内。
+
+        端点分量允许取任意合法有限值（如 -1e308 → 1e308）：``pb - pa`` 本身
+        可能溢出为 inf，``pa + inf·ratio`` 会把真实有限（如中点 0）的插值
+        算成 inf/NaN。差值溢出时改用凸组合 ``pa*(1-r) + pb*r``——数学上是
+        同一条线性轨迹，但两个加数同号，不再溢出，且两端点精确取到。
+        """
         idx = bisect.bisect_right(ts, t) - 1
         idx = min(max(idx, 0), len(points) - 2)
         pa, pb = points[idx], points[idx + 1]
         t0, t1 = pa["ts_epoch"], pb["ts_epoch"]
         ratio = 0.0 if t1 <= t0 else (t - t0) / (t1 - t0)
+
+        def _lerp(v0: float, v1: float, r: float) -> float:
+            delta = v1 - v0
+            if math.isfinite(delta):
+                return v0 + delta * r
+            # 差值超出 float64（合法有限端点异号极大）：凸组合恒为有限值
+            return v0 * (1.0 - r) + v1 * r
+
         return (
-            pa["x"] + (pb["x"] - pa["x"]) * ratio,
-            pa["y"] + (pb["y"] - pa["y"]) * ratio,
+            _lerp(pa["x"], pb["x"], ratio),
+            _lerp(pa["y"], pb["y"], ratio),
         )
 
     # ------------------------------------------------------------------
